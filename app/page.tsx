@@ -10,6 +10,27 @@ type Channel = {
   shows: string[];
 };
 
+type Programme = {
+  title: string;
+  start: string;
+  end: string;
+  category: string;
+  episode: string;
+  description: string;
+};
+
+type ScheduleChannel = {
+  id: string;
+  name: string;
+  programmes: Programme[];
+  error?: string;
+};
+
+type ScheduleResponse = {
+  date: string;
+  channels: ScheduleChannel[];
+};
+
 const channels: Channel[] = [
   {
     id: "ert1",
@@ -195,6 +216,177 @@ function formatDate(date: Date) {
   });
 }
 
+const MELBOURNE_TIME_ZONE = "Australia/Melbourne";
+const GREECE_TIME_ZONE = "Europe/Athens";
+
+function addDaysToDateKey(date: string, amount: number) {
+  const [year, month, day] = date.split("-").map(Number);
+  const result = new Date(
+    Date.UTC(year, month - 1, day + amount)
+  );
+
+  return [
+    result.getUTCFullYear(),
+    String(result.getUTCMonth() + 1).padStart(2, "0"),
+    String(result.getUTCDate()).padStart(2, "0"),
+  ].join("-");
+}
+
+function getDateKeyInZone(date: Date, timeZone: string) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+
+  const values = Object.fromEntries(
+    parts
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value])
+  );
+
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function getMinutesInZone(date: Date, timeZone: string) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+
+  const values = Object.fromEntries(
+    parts
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, Number(part.value)])
+  );
+
+  return values.hour * 60 + values.minute;
+}
+
+function parseErtDateTime(value: string) {
+  return new Date(
+    value
+      .replace(" ", "T")
+      .replace(/([+-]\d{2})(\d{2})$/, "$1:$2")
+  );
+}
+
+function formatTimeInZone(value: string, timeZone: string) {
+  return new Intl.DateTimeFormat("en-AU", {
+    timeZone,
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(parseErtDateTime(value));
+}
+
+function formatDateKey(date: string) {
+  const [year, month, day] = date.split("-").map(Number);
+
+  return new Date(
+    Date.UTC(year, month - 1, day, 12)
+  ).toLocaleDateString("en-AU", {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    timeZone: "UTC",
+  });
+}
+
+function getStartOfDayInZone(date: string, timeZone: string) {
+  const [year, month, day] = date.split("-").map(Number);
+  const targetUtc = Date.UTC(year, month - 1, day);
+
+  const formatter = new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  });
+
+  let guess = targetUtc;
+
+  for (let i = 0; i < 4; i++) {
+    const parts = Object.fromEntries(
+      formatter
+        .formatToParts(new Date(guess))
+        .filter((part) => part.type !== "literal")
+        .map((part) => [part.type, Number(part.value)])
+    );
+
+    const representedUtc = Date.UTC(
+      parts.year,
+      parts.month - 1,
+      parts.day,
+      parts.hour,
+      parts.minute,
+      parts.second
+    );
+
+    const difference = targetUtc - representedUtc;
+    guess += difference;
+
+    if (difference === 0) break;
+  }
+
+  return new Date(guess);
+}
+
+
+function getProgrammePosition(
+  programme: Programme,
+  melbourneDate: string
+) {
+  const dayStart = getStartOfDayInZone(
+    melbourneDate,
+    MELBOURNE_TIME_ZONE
+  ).getTime();
+
+  const nextDayStart = getStartOfDayInZone(
+    addDaysToDateKey(melbourneDate, 1),
+    MELBOURNE_TIME_ZONE
+  ).getTime();
+
+  const programmeStart = parseErtDateTime(
+    programme.start
+  ).getTime();
+
+  const programmeEnd = parseErtDateTime(
+    programme.end
+  ).getTime();
+
+  const visibleStart = Math.max(
+    programmeStart,
+    dayStart
+  );
+
+  const visibleEnd = Math.min(
+    programmeEnd,
+    nextDayStart
+  );
+
+  if (
+    !Number.isFinite(visibleStart) ||
+    !Number.isFinite(visibleEnd) ||
+    visibleEnd <= visibleStart
+  ) {
+    return null;
+  }
+
+  return {
+    startMinutes: (visibleStart - dayStart) / 60_000,
+    endMinutes: (visibleEnd - dayStart) / 60_000,
+    startTime: new Date(visibleStart),
+    endTime: new Date(visibleEnd),
+  };
+}
+
 export default function Home() {
   const [now, setNow] = useState<Date>(
   new Date("2000-01-01T12:00:00Z")
@@ -203,6 +395,18 @@ export default function Home() {
   const [search, setSearch] = useState("");
   const [favourites, setFavourites] = useState<string[]>([]);
   const [favouritesOnly, setFavouritesOnly] = useState(false);
+  const [schedule, setSchedule] = useState<ScheduleResponse | null>(null);
+  const [scheduleLoading, setScheduleLoading] = useState(false);
+  const [scheduleError, setScheduleError] = useState("");
+  const melbourneToday = getDateKeyInZone(
+  now,
+  MELBOURNE_TIME_ZONE
+);
+
+const selectedDate = addDaysToDateKey(
+  melbourneToday,
+  selectedDay
+);
 
   useEffect(() => {
   setNow(new Date());
@@ -214,9 +418,54 @@ export default function Home() {
   return () => window.clearInterval(timer);
   }, []);
 
+  
+useEffect(() => {
+
+  let cancelled = false;
+
+  async function loadSchedule() {
+    setScheduleLoading(true);
+    setScheduleError("");
+
+    try {
+      const response = await fetch(
+        `/api/schedule?date=${selectedDate}`
+      );
+
+      if (!response.ok) {
+        throw new Error("Could not load the TV schedule.");
+      }
+
+      const data: ScheduleResponse = await response.json();
+
+      if (!cancelled) {
+        setSchedule(data);
+      }
+    } catch {
+      if (!cancelled) {
+        setScheduleError(
+          "Unable to load the TV schedule. Please try again."
+        );
+      }
+    } finally {
+      if (!cancelled) {
+        setScheduleLoading(false);
+      }
+    }
+  }
+
+  loadSchedule();
+
+  return () => {
+    cancelled = true;
+  };
+}, [selectedDate]);
+
   // Start two hours before now, rounded down to a half-hour boundary.
-  const currentMinutes =
-  now.getHours() * 60 + now.getMinutes();
+  const currentMinutes = getMinutesInZone(
+  now,
+  MELBOURNE_TIME_ZONE
+);
   const startMinutes = Math.max(
     0,
     Math.floor((currentMinutes - 120) / 30) * 30
@@ -231,16 +480,23 @@ export default function Home() {
   const timelineWidth = timeSlots.length * 110;
 
   const dates = useMemo(
-    () =>
-      Array.from({ length: 7 }, (_, index) => {
-        return new Date(
-          now.getFullYear(),
-          now.getMonth(),
-          now.getDate() + index
-        );
-      }),
-    [now]
-  );
+  () =>
+    Array.from({ length: 7 }, (_, index) => {
+      const dateKey = addDaysToDateKey(
+        melbourneToday,
+        index
+      );
+
+      const [year, month, day] = dateKey
+        .split("-")
+        .map(Number);
+
+      return new Date(
+        Date.UTC(year, month - 1, day, 12)
+      );
+    }),
+  [melbourneToday]
+);
 
   const visibleChannels = channels.filter((channel) => {
     const matchesSearch =
@@ -423,54 +679,159 @@ export default function Home() {
                     />
                   ))}
 
-                  {channel.shows.map((show, programmeIndex) => {
-                    const programmeStart =
-                      programmeBoundaries[programmeIndex];
-                    const programmeEnd =
-                      programmeBoundaries[programmeIndex + 1];
+                  
+{(() => {
+  const realChannel = schedule?.channels.find(
+    (item) => item.id === channel.id
+  );
 
-                    const visibleStart = Math.max(
-                      programmeStart,
-                      startMinutes
-                    );
-                    const visibleEnd = Math.min(programmeEnd, 1440);
+  const liveLinks: Record<string, string> = {
+  ert1: "https://www.ert.gr/tv/live/",
+  ert2: "https://www.ert.gr/tv/live/",
+  ert3: "https://www.ert.gr/tv/live/",
+};
 
-                    if (visibleEnd <= visibleStart) return null;
+  if (realChannel) {
+    return realChannel.programmes.map((programme, index) => {
+      const position = getProgrammePosition(
+        programme,
+        selectedDate
+      );
 
-                    const firstSlot = (visibleStart - startMinutes) / 30;
-                    const spanSlots = (visibleEnd - visibleStart) / 30;
+      if (!position) return null;
 
-                    return (
-                      <button
-                        key={`${channel.id}-${programmeIndex}`}
-                        onClick={() =>
-                          window.alert(
-                            `${channel.name}\n${show}\n${formatTime(programmeStart)} – ${formatTime(programmeEnd)}\n\nThese are sample listings. Real programme information has not been connected yet.`
-                          )
-                        }
-                        title={`${show} (${formatTime(programmeStart)} – ${formatTime(programmeEnd)})`}
-                        style={{
-                          gridColumn: `${firstSlot + 2} / span ${spanSlots}`,
-                          gridRow: row,
-                          zIndex: 10,
-                        }}
-                        className={`m-1 flex min-w-0 flex-col items-start overflow-hidden rounded-lg border p-2 text-left transition hover:brightness-95 ${
-                          categoryColors[programmeIndex]
-                        }`}
-                      >
-                        <span className="mb-1 text-[9px] font-semibold uppercase tracking-wide text-slate-600">
-                          {categories[programmeIndex]}
-                        </span>
-                        <span className="line-clamp-3 text-xs font-bold leading-snug sm:text-sm">
-                          {show}
-                        </span>
-                        <span className="mt-1 text-[10px] text-slate-600">
-                          {formatTime(programmeStart)} –{" "}
-                          {formatTime(programmeEnd)}
-                        </span>
-                      </button>
-                    );
-                  })}
+      const visibleStart = Math.max(
+        position.startMinutes,
+        startMinutes
+      );
+      const visibleEnd = Math.min(
+        position.endMinutes,
+        1440
+      );
+
+      if (visibleEnd <= visibleStart) return null;
+
+      const firstSlot = Math.floor(
+        (visibleStart - startMinutes) / 30
+      );
+      const spanSlots = Math.max(
+        1,
+        Math.ceil((visibleEnd - visibleStart) / 30)
+      );
+
+      return (
+        <button
+          key={`${channel.id}-${programme.start}-${index}`}
+          
+onClick={() => {
+  window.alert(
+    `${channel.name}\n${programme.title}\n\n` +
+    `Category: ${programme.category || "Not available"}\n` +
+    `Episode: ${programme.episode || "Not specified"}\n\n` +
+    `${programme.description || "Description not available."}\n\n` +
+    `Melbourne: ${formatTimeInZone(
+      programme.start,
+      MELBOURNE_TIME_ZONE
+    )} – ${formatTimeInZone(
+      programme.end,
+      MELBOURNE_TIME_ZONE
+    )}\n` +
+    `Greece: ${formatTimeInZone(
+      programme.start,
+      GREECE_TIME_ZONE
+    )} – ${formatTimeInZone(
+      programme.end,
+      GREECE_TIME_ZONE
+    )}`
+  );
+}}
+
+          title={`${programme.title} — Melbourne: ${formatTimeInZone(
+            programme.start,
+            MELBOURNE_TIME_ZONE
+          )}`}
+          style={{
+            gridColumn: `${firstSlot + 2} / span ${spanSlots}`,
+            gridRow: row,
+            zIndex: 10,
+          }}
+          className={`m-1 flex min-w-0 flex-col items-start overflow-hidden rounded-lg border p-2 text-left transition hover:brightness-95 ${
+            categoryColors[index % categoryColors.length]
+          }`}
+        >
+          <span className="line-clamp-3 text-xs font-bold leading-snug sm:text-sm">
+            {programme.title}
+          </span>
+          <span className="mt-1 text-[10px] text-slate-600">
+            {formatTimeInZone(
+              programme.start,
+              MELBOURNE_TIME_ZONE
+            )}{" "}
+            –{" "}
+            {formatTimeInZone(
+              programme.end,
+              MELBOURNE_TIME_ZONE
+            )}
+          </span>
+        </button>
+      );
+    });
+  }
+
+  return channel.shows.map((show, programmeIndex) => {
+    const programmeStart =
+      programmeBoundaries[programmeIndex];
+    const programmeEnd =
+      programmeBoundaries[programmeIndex + 1];
+
+    const visibleStart = Math.max(
+      programmeStart,
+      startMinutes
+    );
+    const visibleEnd = Math.min(
+      programmeEnd,
+      1440
+    );
+
+    if (visibleEnd <= visibleStart) return null;
+
+    const firstSlot = (visibleStart - startMinutes) / 30;
+    const spanSlots = (visibleEnd - visibleStart) / 30;
+
+    return (
+      <button
+        key={`${channel.id}-${programmeIndex}`}
+        title={show}
+        onClick={() =>
+          window.alert(
+            `${channel.name}\n${show}\n\n` +
+            "Real schedule data is not connected for this channel yet."
+          )
+        }
+        style={{
+          gridColumn: `${firstSlot + 2} / span ${spanSlots}`,
+          gridRow: row,
+          zIndex: 10,
+        }}
+        className={`m-1 flex min-w-0 flex-col items-start overflow-hidden rounded-lg border p-2 text-left transition hover:brightness-95 ${
+          categoryColors[programmeIndex]
+        }`}
+      >
+        <span className="mb-1 text-[9px] font-semibold uppercase tracking-wide text-slate-600">
+          {categories[programmeIndex]}
+        </span>
+        <span className="line-clamp-3 text-xs font-bold leading-snug sm:text-sm">
+          {show}
+        </span>
+        <span className="mt-1 text-[10px] text-slate-600">
+          {formatTime(programmeStart)} –{" "}
+          {formatTime(programmeEnd)}
+        </span>
+      </button>
+    );
+  });
+})()}
+
                 </div>
               );
             })}
